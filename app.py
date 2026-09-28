@@ -3,10 +3,14 @@ Trade-box image renderer.
 
 Roblox WebhookLogger builds a URL like
 
-    https://<host>/trade?left=<name>&right=<name>&lp=<ids>&rp=<ids>&page=<n>&of=<m>
+    https://<host>/trade?left=<name>&right=<name>&lp=<tokens>&rp=<tokens>&page=<n>&of=<m>
 
 and hands that URL to Discord as an embed image. Discord fetches it, this
 service composes the trade card, returns a PNG.
+
+Each token in `lp`/`rp` is `<asset_id>[:<flags>]` -- the flags letters are
+`n` (neon), `m` (mega neon), `f` (fly), `r` (ride), in any order. Plain
+`<asset_id>` still works, so old links keep rendering.
 
 Slot positions were measured off the actual template.png (1014x634, 3x3 grid
 per side, each slot is 113x113 with a small inner padding). Pet icons come
@@ -42,6 +46,28 @@ RIGHT_LABEL_RECT = (582, 65,  972, 105)
 # Page indicator in the top-right corner of the card, only drawn when
 # `of > 1`.
 PAGE_RECT = (855, 12, 1005, 52)
+
+# Pet-property badges. Icons live next to app.py as prop_<key>.png. They are
+# 150x150 alpha PNGs; we scale each one down once at startup so the render
+# loop just pastes. `n`/`m` are mutually exclusive (`m` wins if both are
+# sent), so at most three badges appear per slot.
+BADGE_SIZE = 30
+BADGE_GAP  = 2
+
+
+def _load_badge(filename: str) -> Image.Image:
+    path = os.path.join(HERE, filename)
+    return Image.open(path).convert("RGBA").resize(
+        (BADGE_SIZE, BADGE_SIZE), Image.LANCZOS
+    )
+
+
+BADGES = {
+    "n": _load_badge("prop_neon.png"),
+    "m": _load_badge("prop_mega_neon.png"),
+    "f": _load_badge("prop_fly.png"),
+    "r": _load_badge("prop_ride.png"),
+}
 
 
 def _load_font(size: int) -> ImageFont.ImageFont:
@@ -94,15 +120,49 @@ def _fetch_icon(asset_id: str) -> bytes:
     return image.content
 
 
-def _place_icon(img: Image.Image, asset_id: str, cx: int, cy: int) -> None:
+def _place_icon(img: Image.Image, asset_id: str, flags: str, cx: int, cy: int) -> None:
     try:
         raw = _fetch_icon(asset_id)
         icon = Image.open(BytesIO(raw)).convert("RGBA")
     except Exception:
-        return   # a bad id / broken thumbnail just leaves the slot empty
+        icon = None   # a bad id / broken thumbnail just leaves the pet blank
 
-    icon = icon.resize((SLOT_INNER, SLOT_INNER), Image.LANCZOS)
-    img.paste(icon, (cx - SLOT_INNER // 2, cy - SLOT_INNER // 2), icon)
+    if icon is not None:
+        icon = icon.resize((SLOT_INNER, SLOT_INNER), Image.LANCZOS)
+        img.paste(icon, (cx - SLOT_INNER // 2, cy - SLOT_INNER // 2), icon)
+
+    _place_badges(img, flags, cx, cy)
+
+
+def _place_badges(img: Image.Image, flags: str, cx: int, cy: int) -> None:
+    """Draw the property badges along the bottom of the slot, centred.
+    `m` (mega neon) supersedes `n` (neon); order is neon/mega, fly, ride."""
+    if not flags:
+        return
+
+    keys = []
+    if "m" in flags:
+        keys.append("m")
+    elif "n" in flags:
+        keys.append("n")
+    if "f" in flags:
+        keys.append("f")
+    if "r" in flags:
+        keys.append("r")
+    if not keys:
+        return
+
+    total_w = len(keys) * BADGE_SIZE + (len(keys) - 1) * BADGE_GAP
+    start_x = cx - total_w // 2
+    # The slot cell is ~113px tall and the pet icon is 100px; nudging the
+    # badges below the pet's midline keeps them clear of the pet's face but
+    # inside the visible slot border.
+    y = cy + SLOT_INNER // 2 - BADGE_SIZE + 4
+
+    for i, key in enumerate(keys):
+        badge = BADGES[key]
+        x = start_x + i * (BADGE_SIZE + BADGE_GAP)
+        img.paste(badge, (x, y), badge)
 
 
 def _draw_label(
@@ -142,11 +202,26 @@ def _draw_label(
     draw.text((tx, ty), text, fill=LABEL_PINK, font=f)
 
 
-def _parse_ids(raw: str) -> list[str]:
+def _parse_tokens(raw: str) -> list[tuple[str, str]]:
+    """Parse `id[:flags],id[:flags],...` into a list of (asset_id, flags).
+    Unknown flag chars are dropped; missing colon means no flags."""
     if not raw:
         return []
 
-    return [x.strip() for x in raw.split(",") if x.strip()]
+    out = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if ":" in token:
+            asset_id, flags = token.split(":", 1)
+            asset_id = asset_id.strip()
+            flags = "".join(c for c in flags.lower() if c in "nmfr")
+        else:
+            asset_id, flags = token, ""
+        if asset_id:
+            out.append((asset_id, flags))
+    return out
 
 
 @app.route("/trade")
@@ -154,8 +229,8 @@ def trade():
     left_name  = (request.args.get("left")  or "?").strip()[:32]
     right_name = (request.args.get("right") or "?").strip()[:32]
 
-    lp = _parse_ids(request.args.get("lp", ""))[:9]
-    rp = _parse_ids(request.args.get("rp", ""))[:9]
+    lp = _parse_tokens(request.args.get("lp", ""))[:9]
+    rp = _parse_tokens(request.args.get("rp", ""))[:9]
 
     try:
         page  = max(1, int(request.args.get("page", "1")))
@@ -169,18 +244,20 @@ def trade():
     _draw_label(draw, LEFT_LABEL_RECT, left_name, align="left")
     _draw_label(draw, RIGHT_LABEL_RECT, right_name, align="right")
 
-    for i, asset_id in enumerate(lp):
+    for i, (asset_id, flags) in enumerate(lp):
         _place_icon(
             img,
             asset_id,
+            flags,
             LEFT_COL_X[i % 3],
             ROW_Y[i // 3]
         )
 
-    for i, asset_id in enumerate(rp):
+    for i, (asset_id, flags) in enumerate(rp):
         _place_icon(
             img,
             asset_id,
+            flags,
             RIGHT_COL_X[i % 3],
             ROW_Y[i // 3]
         )
